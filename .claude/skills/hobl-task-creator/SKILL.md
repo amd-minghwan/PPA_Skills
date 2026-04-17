@@ -2,29 +2,44 @@
 name: hobl-task-creator
 description: >
     HOBL 任务创建与提交的唯一入口。用户要运行任何 HOBL scenario（idle、teams、lvp、web、cinebench 等）时使用此 skill。
-    支持 ad-hoc 提交和按 testplan JSON 模板多轮提交。通过 Dashboard REST API 提交任务、查询状态、监控执行结果。
+    支持 ad-hoc 提交和按 testplan JSON 模板多轮提交。通过 Dashboard REST API 提交任务并监控执行结果。
     触发词：提交任务、跑测试、用模板跑、testplan、多轮、round、run、submit、execute、create plan、batch submit、批量跑。
 compatibility:
     platform: windows
 metadata:
-    version: "5.1.0"
+    version: "6.0.0"
     category: testing
     tags: ["hobl", "task", "creator", "dashboard", "api", "job", "submit", "plan", "scenario", "template", "testplan", "round", "batch"]
 ---
 
 # HOBL Task Creator Skill
 
+## §0 入口判断
+
+收到用户请求后，按以下规则选择模式：
+
+1. 用户提到 **testplan / 模板 / JSON 文件** → **§4B 模板模式**
+2. 否则 → **§4 Ad-hoc 模式**
+3. 两种模式都先执行 **§2**（Scenario 发现）和 **§3**（Profile 发现）
+
+### 安全护栏
+
+- **Ad-hoc**：`iterations > 10` 时，先向用户确认再提交
+- **模板**：`rounds > 5` 时，先向用户确认再提交
+- 原因：提交即执行（§7.2），不可撤销，大量提交会占用硬件资源
+
+---
+
 ## §1 API 概览
 
 | API | 方法 | 说明 |
 |-----|------|------|
 | `POST /plan/Create` | POST JSON | **提交新任务**（核心） |
-| `GET /plan/Plans` | GET | 查看所有任务列表（手动查询用，自动化流程不调用） |
-| `GET /plan/Scenarios?PlanID=<id>` | GET | 查看某个 Plan 的 scenarios（手动查询用，自动化流程不调用） |
-| `POST /plan/ScenarioType` | POST | 查询 scenario 类型信息（手动查询用，自动化流程不调用） |
 | `GET /plan/ScenariosData?PlanID=<id>` | GET | 获取 Plan scenarios 详情（monitor.py 使用） |
 
 **Base URL**：`http://localhost`（Dashboard 默认运行在本机）
+
+> 其他端点（`/plan/Plans`、`/plan/Scenarios`、`/plan/ScenarioType`）仅供手动查询，自动化流程不使用。
 
 ---
 
@@ -86,8 +101,17 @@ BIRMAN_HOBL_for_idle  (DUT: BIRMAN-01)
 
 > **重要**：`c:\profiles\*.ini` 中的文件不一定在 Dashboard 注册。使用未注册 profile 提交后，API 返回成功但 plan 不会出现在 Plans 页面，也无法被正确调度。
 
-- 未指定时，如果只有单个 profile，直接使用；如果有多个 profile，列出让用户选择。`default` 仅作为 ad-hoc 模式（§4）的 fallback
+### Profile 选择规则
+
+| 模式 | 用户已指定 | 未指定 + 单 profile | 未指定 + 多 profile |
+|------|-----------|-------------------|-------------------|
+| Ad-hoc | 使用用户指定 | 使用该唯一 profile | 列出让用户选（fallback: `default`）|
+| 模板 | 使用用户指定 | 列出让用户确认 | 列出让用户选（无 fallback）|
+
+模板模式不使用默认 profile（原因：模板通常面向远程 DUT，错用 local 会浪费整轮执行）。
+
 - Profile 名称**不含** `.ini` 后缀
+- 若 `list_profiles.py` 执行失败（Dashboard 不通或页面结构变化），提示用户手动输入 profile 名称
 
 ---
 
@@ -138,9 +162,10 @@ python .claude/skills/hobl-task-creator/scripts/submit.py amd_idle_desktop --pro
 ```
 OK PlanID=8519
 {"status":"ok","redirectToUrl":"/plan/Scenarios?PlanID=8519"}
+WAIT_TIME=2880
 ```
 
-提交成功后，按 §5 启动监控。
+提交成功后，从输出提取 `PlanID` 和 `WAIT_TIME`，按 §5 启动监控。
 
 ---
 
@@ -165,14 +190,10 @@ Get-ChildItem c:\hobl\testplans\*.json | ForEach-Object { $_.Name }
 2. Agent 在 testplans/*.json 中查找匹配文件
    - 找到 → 读取并展示 scenario 列表摘要
    - 未找到 → 列出所有 .json 文件让用户选
-3. 确认 profile
-   - 用户已指定 → 直接使用
-   - 未指定 → 运行 `list_profiles.py` 列出 Dashboard 已注册 profile 让用户选择
-   - 模板提交模式下**不使用默认 profile**，必须由用户显式确认
-     （原因：模板通常面向远程 DUT，错用 local 会浪费整轮执行）
+3. 确认 profile（按 §3 Profile 选择规则）
 4. 确认轮次数 N（默认 1）
 5. 执行转换脚本，按队列提交 N 轮（1 秒间隔）
-6. 输出所有 PlanID，在后台终端启动监控最后一个 PlanID
+6. 输出所有 PlanID，从脚本输出提取 WAIT_TIME，在后台终端启动监控并传入**所有** PlanID
 ```
 
 ### §4B.3 转换与提交脚本
@@ -204,7 +225,7 @@ python .claude/skills/hobl-task-creator/scripts/template_submit.py "c:\hobl\test
 
 ## §5 完成监控
 
-Ad-hoc 和模板提交共用本节流程。提交成功拿到 PlanID 后，**在后台终端中运行**（`isBackground=true`）监控脚本。
+Ad-hoc 和模板提交共用本节流程。提交成功拿到 PlanID 后，**在后台终端中运行**（`mode=async`）监控脚本。
 
 路径：`.claude/skills/hobl-task-creator/scripts/monitor.py`
 
@@ -214,8 +235,8 @@ python .claude/skills/hobl-task-creator/scripts/monitor.py <wait_time秒> <plan_
 
 | 参数 | 必填 | 默认值 | 说明 |
 |---|---|---|---|
-| `wait_time` | 是 | - | 首次检查前的等待秒数（由 Agent 按 §6 公式计算） |
-| `plan_id_N` | 是 | - | 要监控的 PlanID 列表，最后一个用于轮询判断完成 |
+| `wait_time` | 是 | - | 总预估等待秒数（从提交脚本输出的 `WAIT_TIME=<seconds>` 提取） |
+| `plan_id_N` | 是 | - | 要监控的 PlanID 列表（按提交顺序） |
 | `--base-url` | 否 | `http://localhost` | Dashboard 地址 |
 
 示例：
@@ -224,68 +245,61 @@ python .claude/skills/hobl-task-creator/scripts/monitor.py <wait_time秒> <plan_
 python .claude/skills/hobl-task-creator/scripts/monitor.py 5760 8519 8520 8521
 ```
 
-脚本行为：sleep(wait_time) → 每 300s 轮询最后一个 PlanID（最多 5 次）→ 完成后输出所有 PlanID 的 RunDir → 统计 FAIL 数量并提示是否需要 failure-analyzer。
+### 逐 plan 监控机制
+
+脚本将 `wait_time` 均分到每个 plan（`per_plan_wait = wait_time / N`），然后**逐个 plan** 依序执行：
+
+1. sleep `per_plan_wait` 秒
+2. 轮询该 PlanID 直到所有 scenario `State=="Complete"`（最多 12 次，每次间隔 300s）
+3. **立即输出该 plan 的结果**（RunDir + Status）
+4. 若有 FAIL scenario，**立即输出 WARNING**
+5. 继续监控下一个 plan
+
+> 优势：3 轮任务各 3600s 时，第一轮完成后（~3600s）即可发现 FAIL，无需等待全部 10800s。
 
 > Dashboard 中 `State` 表示执行阶段（Queued / Running / Complete），`Status` 表示执行结果（PASS / FAIL）。monitor.py 用 `State=="Complete"` 判断结束，用 `Status=="FAIL"` 统计失败。
 
 ---
 
-## §6 wait_time 计算
+## §6 wait_time 获取
 
-Agent 在提交完成后、启动监控脚本前，按以下公式计算 `wait_time`（秒）。HOBL plan 内 scenario 按 Seq 顺序**串行**执行，因此必须乘以 scenario 数量。
+提交脚本（`submit.py` / `template_submit.py`）在成功提交后会自动输出 `WAIT_TIME=<seconds>`。Agent 从脚本输出中提取该值，直接传给 §5 监控脚本，**无需手动计算**。
 
-### Ad-hoc 模式
+### 内部计算公式（仅供参考）
 
-```
-wait_time = num_scenarios × (prep_time + duration) × iterations
-```
+脚本内部按以下公式估算 wait_time：
 
-| 变量 | 来源 | 默认值 |
+**Ad-hoc 模式**：`num_scenarios × (setup_overhead + duration) × iterations`
+
+**模板模式**：`rounds × num_enabled_rows × (setup_overhead + duration) × max_iterations`
+
+| 常量 | 值 | 说明 |
 |---|---|---|
-| `num_scenarios` | 提交的 scenario 个数 | - |
-| `prep_time` | 固定 | 180 |
-| `duration` | 用户通过 parameters 显式指定时取该值 | 300 |
-| `iterations` | 提交时的 Iterations 值 | 1 |
-
-**示例**：3 个 scenario，`iterations=6`，未指定 duration：
-`3 × (180 + 300) × 6 = 8640s ≈ 2.4h`
-
-**示例**：1 个 scenario，`duration=10, iterations=6`：
-`1 × (180 + 10) × 6 = 1140s ≈ 19min`
-
-### 模板模式
-
-```
-wait_time = rounds × num_enabled_rows × (prep_time + duration) × max_iterations
-```
-
-| 变量 | 来源 | 默认值 |
-|---|---|---|
-| `rounds` | 提交轮次数 | - |
-| `num_enabled_rows` | JSON 中 `Enabled=true` 的行数（Agent 在 §4B.2 步骤 2 读 JSON 时已获取） | - |
-| `prep_time` | 固定 | 180 |
-| `duration` | 固定（模板中 duration 对 agent 不可见） | 300 |
-| `max_iterations` | 所有 enabled 行中最大的 Iterations 值 | 1 |
+| `setup_overhead` | 180s | 每个 scenario 的 HOBL 框架初始化开销，与 prep scenario 无关 |
+| `duration` | 300s | scenario 默认执行时长。Ad-hoc 模式下若 parameters 中有 `duration=N`，取该值 |
 
 > 宁可高估也不低估。高估只是 monitor 多等一会，低估会导致轮询窗口覆盖不到实际完成时间。
-
-**示例**：3 轮，8 个 enabled 行，max_iterations=3：
-`3 × 8 × (180 + 300) × 3 = 34560s ≈ 9.6h`
-
-Agent 计算好 wait_time 后作为第一个参数传给 §5 监控脚本。
 
 ---
 
 ## §7 注意事项
 
 1. **Dashboard 必须运行**：确保 Dashboard 地址可访问（默认 `http://localhost`，远程时用 `--base-url` 指定），否则所有 API 调用失败
-2. **Dashboard 升级兼容性**：若 `list_profiles.py` 提取失败，检查 Dashboard 页面结构是否变化
-3. **提交即执行**：`/plan/Create` 创建计划后，Dashboard 自动调度执行，无需额外触发
-4. **必须通过 Dashboard 提交**：直接 `python hobl.py` 不会上报结果到 Web
-5. **Prep scenario 放前面**：如 `amd_cinebench_prep` → `amd_cinebench_nt`
-6. **多笔 nidata 用 `Iterations`**：`Iterations='6'` → 6 个独立 RunDir，不要用 `repeat=N` 参数替代
-7. **Parameters 格式**：`module:key=value`，分隔符是 `:` 不是 `.`，多个参数用**空格**分隔
-8. **Meta 仅第 0 行需要，其余行不传**
-9. **模板 JSON 中 `Command` 字段被忽略**：API 不需要此字段，转换时直接跳过
-10. **模板提交的 profile**：testplan JSON 中不含 profile 信息，必须由用户在调用时显式指定。与 ad-hoc 模式（§4 默认 `default`）不同，模板模式不使用默认值
-11. **Expand 与 StudyVars**：`Expand` 非空时表示该 scenario 行会在 Dashboard 端按 `StudyVars` 定义展开为多行。实际执行行数 = Scenarios 条数 × 展开组合数。Agent 原样透传 `Expand` 和 `StudyVars`，无需自行计算展开结果
+2. **提交即执行**：`/plan/Create` 创建计划后，Dashboard 自动调度执行，无需额外触发
+3. **必须通过 Dashboard 提交**：直接 `python hobl.py` 不会上报结果到 Web
+4. **Prep scenario 放前面**：如 `amd_cinebench_prep` → `amd_cinebench_nt`
+5. **多笔 nidata 用 `Iterations`**：`Iterations='6'` → 6 个独立 RunDir，不要用 `repeat=N` 参数替代
+6. **Parameters 格式**：`module:key=value`，分隔符是 `:` 不是 `.`，多个参数用**空格**分隔
+7. **Meta 仅第 0 行需要，其余行不传**
+8. **模板 JSON 中 `Command` 字段被忽略**：API 不需要此字段，转换时直接跳过
+9. **模板提交的 profile**：testplan JSON 中不含 profile 信息，必须由用户在调用时显式指定（见 §3 Profile 选择规则）
+10. **Expand 与 StudyVars**：`Expand` 非空时表示该 scenario 行会在 Dashboard 端按 `StudyVars` 定义展开为多行。实际执行行数 = Scenarios 条数 × 展开组合数。Agent 原样透传 `Expand` 和 `StudyVars`，无需自行计算展开结果
+
+### 错误恢复
+
+| 错误场景 | Agent 行为 |
+|---|---|
+| Dashboard 不可达（脚本输出 `ERROR: Cannot connect`） | 提示用户确认 Dashboard 是否运行，确认 `--base-url` 是否正确 |
+| `list_profiles.py` 返回 0 个 profile 或解析失败 | 提示用户手动输入 profile 名称（Dashboard 页面结构可能已变化） |
+| Monitor timeout（脚本 exit code 1） | 提示用户在 Dashboard 网页上手动检查 Plan 状态 |
+| 提交失败（脚本输出 `ERROR`） | 显示错误信息，不启动 monitor |
